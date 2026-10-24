@@ -1,0 +1,33 @@
+name: CI — Scraping Workers (Node.js)
+
+on:
+  push:
+    branches:
+      - main
+      - desenv
+  pull_request:
+    branches:
+      - main
+      - desenv
+
+jobs:
+  test-and-lint:
+    name: Node Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Run Tests
+        run: npm test
