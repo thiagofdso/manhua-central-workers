@@ -2,12 +2,13 @@
   "name": "scraping-workers",
   "version": "1.0.0",
   "description": "Manhua Central — Worker Pool em Node.js/Puppeteer para Scraping e Bypass de Turnstile/Cloudflare",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
-    "test": "echo \"Worker unit tests passed\" && exit 0"
+    "dev": "node --experimental-strip-types src/index.ts",
+    "test": "node --experimental-strip-types test/extractors.test.ts"
   },
   "dependencies": {
     "puppeteer": "^22.15.0"
