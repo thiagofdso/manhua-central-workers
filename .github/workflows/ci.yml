@@ -3,10 +3,12 @@ name: CI — Scraping Workers (Node.js)
 on:
   push:
     branches:
+      - master
       - main
       - desenv
   pull_request:
     branches:
+      - master
       - main
       - desenv
 
@@ -17,6 +19,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -31,3 +35,8 @@ jobs:
 
       - name: Run Tests
         run: npm test
+
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
