@@ -19,14 +19,18 @@ export class BrowserPool {
   private async getBrowser(): Promise<Browser> {
     if (!this.browser || !this.browser.connected) {
       this.browser = await puppeteer.launch({
-        headless: true,
+        executablePath: process.env.COVER_BROWSER_EXECUTABLE || undefined,
+        headless: process.env.COVER_BROWSER_HEADLESS === 'true',
+        ignoreDefaultArgs: ['--enable-automation'],
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
           '--disable-gpu',
           '--disable-software-rasterizer',
-          '--mute-audio'
+          '--mute-audio',
+          '--window-size=1280,1000'
         ]
       });
     }
@@ -69,11 +73,11 @@ export class BrowserPool {
       context = await browser.createBrowserContext();
       page = await context.newPage();
 
-      // Optimize bandwidth and memory: block heavy media not needed for scraping
+      // Optimize bandwidth and memory: block heavy audio/video media
       await page.setRequestInterception(true);
       page.on('request', (req: any) => {
         const resourceType = req.resourceType();
-        if (resourceType === 'stylesheet' || resourceType === 'font' || resourceType === 'media') {
+        if (resourceType === 'media') {
           req.abort();
         } else {
           req.continue();
