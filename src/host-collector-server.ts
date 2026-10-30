@@ -18,6 +18,10 @@ export function createHostCollector(token: string): http.Server {
       res.end(JSON.stringify({ status: 'ok', mode: 'host', domains: [...allowed] }));
       return;
     }
+    const cancellation = new AbortController();
+    res.once('close', () => {
+      if (!res.writableEnded) cancellation.abort(new Error('Collector client disconnected'));
+    });
 
     if (req.method === 'GET' && req.url?.startsWith('/stream-image')) {
       const parsed = new URL(req.url, 'http://127.0.0.1:50052');
@@ -27,7 +31,7 @@ export function createHostCollector(token: string): http.Server {
         return;
       }
       try {
-        const result = await collectImage(imgURL);
+        const result = await collectImage(imgURL, undefined, cancellation.signal);
         res.writeHead(200, {
           'Content-Type': result.type,
           'Content-Length': result.bytes.length,
@@ -71,13 +75,13 @@ export function createHostCollector(token: string): http.Server {
     }
     try {
       if (req.url === '/collect-catalog') {
-        const result = await collectCatalog(payload.domain, payload.query, payload.page);
+        const result = await collectCatalog(payload.domain, payload.query, payload.page, cancellation.signal);
         console.log(`[Host collector] ${payload.domain} page=${payload.page} items=${result.items.length}`);
         res.end(JSON.stringify(result));
       } else if (req.url === '/extract-chapter') {
         const normDomain = (payload.domain || '').replace(/^www\./, '').toLowerCase();
         const targetDomain = normDomain.includes('manhuaus') ? 'manhuaus.com' : 'ravenscans.org';
-        const data = await collectChapter(payload.url, targetDomain, payload.chapter || 1);
+        const data = await collectChapter(payload.url, targetDomain, payload.chapter || 1, cancellation.signal);
         const images = (data.images || []).map((u, idx) => ({ index: idx + 1, url: u }));
         console.log(`[Host collector] Extracted chapter ${payload.chapter} for ${targetDomain}: ${images.length} images`);
         res.end(JSON.stringify({
@@ -90,7 +94,7 @@ export function createHostCollector(token: string): http.Server {
           prevChapter: data.prevUrl || undefined
         }));
       } else {
-        const cover = await collectCover(payload.pageURL, payload.imageURL);
+        const cover = await collectCover(payload.pageURL, payload.imageURL, cancellation.signal);
         res.writeHead(200, { 'Content-Type': cover.type, 'X-Cover-Source': cover.source });
         res.end(cover.bytes);
       }

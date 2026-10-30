@@ -4,25 +4,36 @@ import fs from 'node:fs/promises';
 
 const domains = new Set(['manhuaus.com', 'ravenscans.org', 'manhuatop.org']);
 const browsers = new Map<string, Browser>();
+const verificationPages = new Map<string, Page>();
+const workingPages = new Map<string, Page>();
 let queue: Promise<unknown> = Promise.resolve();
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 let closing = false;
 let nextSourceAccess = 0;
+
+function enqueue<T>(action: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const task = queue.then(() => {
+    signal?.throwIfAborted();
+    return action();
+  });
+  queue = task.catch(() => undefined);
+  return task;
+}
 
 export async function closeCoverBrowsers(): Promise<void> {
   closing = true;
   clearTimeout(idleTimer);
   await Promise.all([...browsers.values()].map(browser => browser.close().catch(() => undefined)));
   browsers.clear();
+  verificationPages.clear();
+  workingPages.clear();
 }
 
-export function collectCover(pageURL: string, imageURL?: string): Promise<{ bytes: Buffer; type: string; source: string }> {
-  const task = queue.then(() => download(pageURL, imageURL));
-  queue = task.catch(() => undefined);
-  return task;
+export function collectCover(pageURL: string, imageURL?: string, signal?: AbortSignal): Promise<{ bytes: Buffer; type: string; source: string }> {
+  return enqueue(() => download(pageURL, imageURL, signal), signal);
 }
 
-export function collectImage(imageURL: string, pageURL?: string): Promise<{ bytes: Buffer; type: string; source: string }> {
+export function collectImage(imageURL: string, pageURL?: string, signal?: AbortSignal): Promise<{ bytes: Buffer; type: string; source: string }> {
   const target = new URL(imageURL);
   let baseDomain = target.hostname.replace(/^www\./, '');
   for (const d of domains) {
@@ -32,7 +43,7 @@ export function collectImage(imageURL: string, pageURL?: string): Promise<{ byte
     }
   }
   const refPage = pageURL || `https://${baseDomain}/`;
-  const task = queue.then(() => withSourcePage(refPage, 'body', async (page) => {
+  return enqueue(() => withSourcePage(refPage, 'body', async (page) => {
     await page.setExtraHTTPHeaders({ Referer: `https://${baseDomain}/` });
     try {
       const data = await page.evaluate(async (url) => {
@@ -56,12 +67,10 @@ export function collectImage(imageURL: string, pageURL?: string): Promise<{ byte
       const type = response.headers()['content-type'] || 'image/webp';
       return { bytes, type, source: target.href };
     }
-  }));
-  queue = task.catch(() => undefined);
-  return task;
+  }, signal), signal);
 }
 
-async function download(pageURL: string, imageURL?: string): Promise<{ bytes: Buffer; type: string; source: string }> {
+async function download(pageURL: string, imageURL?: string, signal?: AbortSignal): Promise<{ bytes: Buffer; type: string; source: string }> {
   return withSourcePage(pageURL, '.thumb img,.summary_image img,meta[property="og:image"]', async (page, origin) => {
     const domain = origin.hostname.replace(/^www\./, '');
     const source = imageURL || await page.evaluate(() => {
@@ -78,10 +87,10 @@ async function download(pageURL: string, imageURL?: string): Promise<{ bytes: Bu
     const type = response.headers()['content-type'] || '';
     if (bytes.length > 8 * 1024 * 1024 || !type.startsWith('image/')) throw new Error('Invalid cover response');
     return { bytes, type, source: target.href };
-  });
+  }, signal);
 }
 
-export function collectCatalog(domain: string, query: string, pageNumber: number) {
+export function collectCatalog(domain: string, query: string, pageNumber: number, signal?: AbortSignal) {
   if (!domains.has(domain) || !Number.isInteger(pageNumber) || pageNumber < 1) throw new Error('Invalid catalog request');
   const url = new URL(domain === 'manhuaus.com' ? (pageNumber === 1 ? '/manga/' : `/manga/page/${pageNumber}/`) : '/manga/', 'https://' + domain);
   if (query) {
@@ -95,7 +104,7 @@ export function collectCatalog(domain: string, query: string, pageNumber: number
     url.searchParams.set('page', String(pageNumber));
     if (!query) url.searchParams.set('order', 'update');
   }
-  const task = queue.then(() => withSourcePage(url.href, '.page-item-detail,.c-tabs-item__content,.bsx', async page => page.evaluate((domain, pageNumber) => {
+  return enqueue(() => withSourcePage(url.href, '.page-item-detail,.c-tabs-item__content,.bsx', async page => page.evaluate((domain, pageNumber) => {
     const items = [];
     const seen = new Set<string>();
     for (const card of document.querySelectorAll('.page-item-detail,.c-tabs-item__content,.bsx')) {
@@ -118,12 +127,10 @@ export function collectCatalog(domain: string, query: string, pageNumber: number
     }
     if (document.querySelector('link[rel="next"],a.next,a.nextpostslink,#navigation-ajax') && items.length) totalPages = Math.max(totalPages, pageNumber + 1);
     return { items, page: pageNumber, totalPages };
-  }, domain, pageNumber)));
-  queue = task.catch(() => undefined);
-  return task;
+  }, domain, pageNumber), signal), signal);
 }
 
-async function withSourcePage<Result>(pageURL: string, selector: string, action: (page: Page, origin: URL) => Promise<Result>): Promise<Result> {
+async function withSourcePage<Result>(pageURL: string, selector: string, action: (page: Page, origin: URL) => Promise<Result>, signal?: AbortSignal): Promise<Result> {
   if (closing) throw new Error('Cover collector is shutting down');
   const origin = new URL(pageURL);
   const domain = origin.hostname.replace(/^www\./, '');
@@ -146,8 +153,21 @@ async function withSourcePage<Result>(pageURL: string, selector: string, action:
     browsers.set(domain, browser);
     console.log(`[Cover collector] Browser started for ${domain}: ${await browser.version()}`);
   }
-  const page = await browser.newPage();
+  let page = workingPages.get(domain);
+  if (!page || page.isClosed()) {
+    page = await browser.newPage();
+    workingPages.set(domain, page);
+  }
+  const activePage = page;
+  const cancel = () => {
+    if (verificationPages.get(domain) !== activePage) {
+      workingPages.delete(domain);
+      void activePage.close().catch(() => undefined);
+    }
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
   try {
+    signal?.throwIfAborted();
     await page.setUserAgent((await browser.userAgent()).replace('HeadlessChrome/', 'Chrome/'));
     const interval = Math.max(0, Number(process.env.CATALOG_COLLECTOR_INTERVAL_MS) || 0);
     if (interval) {
@@ -155,11 +175,13 @@ async function withSourcePage<Result>(pageURL: string, selector: string, action:
       nextSourceAccess = Date.now() + interval;
     }
     const navigation = await page.goto(pageURL, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => null);
+    signal?.throwIfAborted();
 
     // Handle Cloudflare Turnstile challenge if present (matching manhuaus_extractor.mjs)
     const manualWait = Math.max(0, Number(process.env.CATALOG_COLLECTOR_MANUAL_WAIT_MS) || 0);
-    const challengeDeadline = Date.now() + (manualWait || 30000);
+    const challengeDeadline = Date.now() + 30000;
     for (; Date.now() < challengeDeadline;) {
+      signal?.throwIfAborted();
       const title = (await page.title().catch(() => '')).toLowerCase();
       const isChallenge = title.includes('just a moment') ||
                           title.includes('um momento') ||
@@ -167,7 +189,7 @@ async function withSourcePage<Result>(pageURL: string, selector: string, action:
                           title.includes('attention required');
       if (!isChallenge) break;
 
-      for (const frame of manualWait ? [] : page.frames()) {
+      for (const frame of page.frames()) {
         const fUrl = frame.url();
         if (fUrl.includes('cloudflare') || fUrl.includes('challenges')) {
           try {
@@ -185,6 +207,23 @@ async function withSourcePage<Result>(pageURL: string, selector: string, action:
       await new Promise(r => setTimeout(r, 1000));
     }
 
+    if (manualWait) {
+      const title = (await page.title().catch(() => '')).toLowerCase();
+      if (title.includes('just a moment') || title.includes('um momento') || title.includes('cloudflare') || title.includes('attention required')) {
+        const existing = verificationPages.get(domain);
+        if (!existing || existing.isClosed()) {
+          verificationPages.set(domain, page);
+          workingPages.delete(domain);
+        }
+        throw new Error(`Source requires manual verification: ${domain}, HTTP ${navigation?.status()}`);
+      }
+      const existing = verificationPages.get(domain);
+      if (existing && (existing.isClosed() || !/just a moment|um momento|cloudflare|attention required/i.test(await existing.title().catch(() => '')))) {
+        verificationPages.delete(domain);
+        await existing.close().catch(() => undefined);
+      }
+    }
+
     try {
       await page.waitForSelector(selector, { timeout: 20000 });
     } catch {
@@ -197,22 +236,31 @@ async function withSourcePage<Result>(pageURL: string, selector: string, action:
         throw new Error(`Source did not release content: HTTP ${navigation?.status()}, title=${title}, browser=${await browser.version()}`);
       }
     }
-    return await action(page, origin);
+    const result = await action(page, origin);
+    signal?.throwIfAborted();
+    return result;
   } finally {
-    await page.close().catch(() => undefined);
+    signal?.removeEventListener('abort', cancel);
+    if (page.isClosed()) workingPages.delete(domain);
     idleTimer = setTimeout(() => {
-      for (const browser of browsers.values()) void browser.close();
-      browsers.clear();
+      for (const [domain, browser] of browsers) {
+        const verification = verificationPages.get(domain);
+        if (verification && !verification.isClosed()) continue;
+        verificationPages.delete(domain);
+        workingPages.delete(domain);
+        void browser.close();
+        browsers.delete(domain);
+      }
     }, 300000);
     idleTimer.unref();
   }
 }
 
-export function collectChapter(pageURL: string, domain: string, chapter: number = 1): Promise<{ images: string[]; nextUrl?: string | null; prevUrl?: string | null }> {
+export function collectChapter(pageURL: string, domain: string, chapter: number = 1, signal?: AbortSignal): Promise<{ images: string[]; nextUrl?: string | null; prevUrl?: string | null }> {
   const normDomain = domain.replace(/^www\./, '');
   if (!domains.has(normDomain)) throw new Error(`Unsupported chapter collection domain: ${normDomain}`);
 
-  const task = queue.then(() => withSourcePage(pageURL, '#readerarea img, .reading-content img, .wp-manga-chapter-img, #chapter-reader img, .entry-content img, .reader-image img, #readerarea, .reader-image, .reading-content', async (page) => {
+  return enqueue(() => withSourcePage(pageURL, '#readerarea img, .reading-content img, .wp-manga-chapter-img, #chapter-reader img, .entry-content img, .reader-image img, #readerarea, .reader-image, .reading-content', async (page) => {
     await new Promise(r => setTimeout(r, 2000));
     const currentTitle = await page.title().catch(() => '');
     console.log(`[collectChapter] for ${normDomain}: title="${currentTitle}"`);
@@ -254,8 +302,5 @@ export function collectChapter(pageURL: string, domain: string, chapter: number 
     });
     console.log(`[collectChapter] extraction result:`, evalResult.matched);
     return evalResult;
-  }));
-
-  queue = task.catch(() => undefined);
-  return task;
+  }, signal), signal);
 }
